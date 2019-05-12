@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: S3 events Kinesis proxy
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General Configuration
+        Parameters:
+          - S3BucketName
+          - OutputStreamName
+          - ShardCount
+    ParameterLabels:
+      - S3BucketName:
+          default: Name of S3 bucket
+      - OutputStreamName:
+          default: A name of the output Kinesis stream
+      - ShardCount:
+          default: Number of Kinesis streams shards
+Parameters:
+  S3BucketName:
+    AllowedPattern: ^[-a-zA-Z0-9]{4,61}$
+    ConstraintDescription: Bucket name must not contain uppercase characters or underscores
+    Default: s3event-delivery-asaushkin
+    Type: String
+  OutputStreamName:
+    AllowedPattern: ^[-a-zA-Z0-9_]{4,61}$
+    ConstraintDescription: Should be a valid Kinesis topic name
+    Default: s3event-delivery-stream
+    Type: String
+  ShardCount:
+    Default: 1
+    Type: Number
+
+Resources:
+  # S3 bucket configuration
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3EventProxy.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt S3EventProxy.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${S3BucketName}'
+
+  # Kinesis delivery stream for all events in the S3 bucket
+  S3EventsDeliveryStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref OutputStreamName
+      ShardCount: !Ref ShardCount
+
+  # Send all s3 events to the delivery stream
+  S3EventProxy:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: S3EventProxy
+      Handler: me.asaushkin.LambdaS3EventProxy
+      CodeUri: ./s3event-receiver-lambda/target/s3event-receiver-lambda-1.0-SNAPSHOT.jar
+      Runtime: java8
+      Role: !GetAtt S3ProxyExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref S3EventsDeliveryStream
+
+  # Get all s3 events from the delivery stream
+  S3ProxyConsumer:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: S3ProxyConsumer
+      Handler: me.asaushkin.LambdaS3ProxyConsumer
+      CodeUri: ./s3event-receiver-lambda/target/s3event-receiver-lambda-1.0-SNAPSHOT.jar
+      Runtime: java8
+      Role: !GetAtt S3ProxyExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref S3EventsDeliveryStream
+
+  S3ProxyExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisAccessPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: KinesisAccessPolicy
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListShards
+                  - kinesis:ListStreams
+                  - kinesis:SubscribeToShard
+                  - kinesis:PutRecords
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  S3EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt S3EventsDeliveryStream.Arn
+      FunctionName: !GetAtt S3ProxyConsumer.Arn
+      # process s3 events in series https://stackoverflow.com/a/42693053/2743959
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 1
+
